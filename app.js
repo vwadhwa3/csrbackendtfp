@@ -12,6 +12,7 @@ const { db, getPool } = require("./config/db");
 
 // Routes
 const authRoutes = require("./routes/auth");
+const csrRoutes = require("./routes/csr");
 
 const app = express();
 
@@ -136,6 +137,7 @@ app.use((req, res, next) => {
 /* ===================== ROUTES ===================== */
 
 app.use("/api/auth", authRoutes);
+app.use("/api/csr", csrRoutes);
 
 app.get("/health", async (req, res) => {
   try {
