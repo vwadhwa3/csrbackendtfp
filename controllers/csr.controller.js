@@ -1,6 +1,7 @@
 const {
   HttpError,
   listMyTasksService,
+  getMyTaskService,
   completeTaskService,
 } = require("../services/csr.service");
 
@@ -46,6 +47,17 @@ const listMyTasks = async (req, res) => {
   }
 };
 
+// GET /api/csr/tasks/:taskId
+const getTask = async (req, res) => {
+  try {
+    const taskId = parseId(req.params.taskId, "taskId");
+    const task = await getMyTaskService(req.user.user_id, taskId);
+    return res.status(200).json({ success: true, task });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
 // POST /api/csr/tasks/:taskId/complete
 const completeTask = async (req, res) => {
   try {
@@ -58,4 +70,4 @@ const completeTask = async (req, res) => {
   }
 };
 
-module.exports = { listMyTasks, completeTask };
+module.exports = { listMyTasks, getTask, completeTask };

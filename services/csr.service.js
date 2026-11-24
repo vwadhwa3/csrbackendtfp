@@ -62,7 +62,59 @@ const STATUS_FILTER = {
   resolved: ["completed"],
 };
 
-/* ---------------- list my tasks ---------------- */
+/* ---------------- list / view my tasks ---------------- */
+
+const fullName = (first, surname) => [first, surname].filter(Boolean).join(" ") || null;
+
+// Shared by the list and the detail view. Read-only.
+// A CSR only gets tasks assigned to them, on cases assigned to them.
+const TASK_SELECT = `
+  SELECT t.task_id, t.case_id, t.application_id, t.task_type_id,
+         s.task_type_code, s.label AS task_label,
+         t.status, t.description, t.due_by, t.comments,
+         t.creation_timestamp, t.updated_by, t.updation_timestamp,
+         a.status_id AS application_status_id, st.label AS application_status_label,
+         a.applicant_id,
+         ap.first_name AS applicant_first_name, ap.surname AS applicant_surname,
+         c.lead_contact_id,
+         ld.first_name AS lead_first_name, ld.surname AS lead_surname,
+         f.form_id, f.status AS form_status, f.submitted_at AS form_submitted_at
+    FROM task t
+    JOIN b_case c ON c.case_id = t.case_id
+LEFT JOIN s_task s ON s.task_type_id = t.task_type_id
+LEFT JOIN b_applications a ON a.application_id = t.application_id
+LEFT JOIN app_status st ON st.status_id = a.status_id
+LEFT JOIN b_contact ap ON ap.contact_id = a.applicant_id
+LEFT JOIN b_contact ld ON ld.contact_id = c.lead_contact_id
+LEFT JOIN application_form f ON f.application_id = t.application_id AND f.discontinued_at IS NULL
+   WHERE t.assigned_to_user_id = $1
+     AND c.assigned_csr_user_id = $1
+     AND t.discontinued_at IS NULL`;
+
+const shapeTask = (row) => {
+  const {
+    applicant_id, applicant_first_name, applicant_surname,
+    lead_contact_id, lead_first_name, lead_surname,
+    form_id, form_status, form_submitted_at,
+    ...task
+  } = row;
+
+  return {
+    ...task,
+    // The task shows who the applicant is and which case it belongs to.
+    applicant: task.application_id
+      ? { applicantId: applicant_id, name: fullName(applicant_first_name, applicant_surname) }
+      : null,
+    case: {
+      caseId: task.case_id,
+      leadContactId: lead_contact_id,
+      leadName: fullName(lead_first_name, lead_surname),
+    },
+    form: form_id ? { formId: form_id, status: form_status, submittedAt: form_submitted_at } : null,
+    state: STATUS_FILTER.resolved.includes(task.status) ? "resolved" : "open",
+    completable: Boolean(CSR_TASK_RULES[task.task_type_id]),
+  };
+};
 
 const listMyTasksService = async (csrUserId, { caseId, status = "open" }) => {
   const statuses = STATUS_FILTER[status];
@@ -78,29 +130,24 @@ const listMyTasksService = async (csrUserId, { caseId, status = "open" }) => {
   }
 
   const result = await getPool().query(
-    `SELECT t.task_id, t.case_id, t.application_id, t.task_type_id,
-            s.task_type_code, s.label AS task_label,
-            t.status, t.description, t.due_by, t.comments,
-            t.creation_timestamp, t.updated_by, t.updation_timestamp,
-            a.status_id AS application_status_id
-       FROM task t
-       JOIN b_case c ON c.case_id = t.case_id
-  LEFT JOIN s_task s ON s.task_type_id = t.task_type_id
-  LEFT JOIN b_applications a ON a.application_id = t.application_id
-      WHERE t.assigned_to_user_id = $1
-        AND c.assigned_csr_user_id = $1
-        AND t.discontinued_at IS NULL
+    `${TASK_SELECT}
         AND t.status = ANY($2)
         ${caseFilter}
       ORDER BY t.due_by NULLS LAST, t.task_id`,
     params,
   );
 
-  return result.rows.map((row) => ({
-    ...row,
-    state: STATUS_FILTER.resolved.includes(row.status) ? "resolved" : "open",
-    completable: Boolean(CSR_TASK_RULES[row.task_type_id]),
-  }));
+  return result.rows.map(shapeTask);
+};
+
+// GET one task (same ownership rules as the list).
+const getMyTaskService = async (csrUserId, taskId) => {
+  const result = await getPool().query(`${TASK_SELECT} AND t.task_id = $2`, [csrUserId, taskId]);
+  if (!result.rows[0]) {
+    // Same answer whether it doesn't exist or belongs to someone else.
+    throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
+  }
+  return shapeTask(result.rows[0]);
 };
 
 /* ---------------- complete a task (+ move status) ---------------- */
@@ -277,4 +324,4 @@ const completeTaskService = async (csrUserId, taskId, body, ip) => {
   }
 };
 
-module.exports = { HttpError, listMyTasksService, completeTaskService };
+module.exports = { HttpError, listMyTasksService, getMyTaskService, completeTaskService };
