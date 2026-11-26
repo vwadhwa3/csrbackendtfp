@@ -1,4 +1,6 @@
 const { getPool } = require("../config/db");
+const { createDocument, deleteDocument, GoogleDocsError } = require("./googleDocs.service");
+const { buildPreparedDocumentHtml, buildInvoiceHtml } = require("./docTemplates");
 
 class HttpError extends Error {
   constructor(status, code, message) {
@@ -55,6 +57,11 @@ const CSR_TASK_RULES = {
     event: "A11",
   },
 };
+
+// s_user.user_role_type_id values (same ids as middleware/role.middleware.js)
+const ROLE_CSR = 2;
+const ROLE_LEAD_CONSULTANT = 4;
+const ROLE_TEAM_LEAD = 26;
 
 // open / resolved are the CSR-facing names; DB values stay as they are.
 const STATUS_FILTER = {
@@ -324,4 +331,228 @@ const completeTaskService = async (csrUserId, taskId, body, ip) => {
   }
 };
 
-module.exports = { HttpError, listMyTasksService, getMyTaskService, completeTaskService };
+/* ---------------- Prepare: Google Doc + invoice (Appointment Booked) ---------------- */
+
+// The doc link is stored in the existing `attachment` table (no schema change):
+// application_id + url_path = link, document_type_id NULL, file_name = the marker below.
+const PREPARED_DOCS = {
+  preparedDocument: {
+    fileName: "Prepared Documents (Google Doc)",
+    title: (id) => `Prepared Documents - Application ${id}`,
+    html: buildPreparedDocumentHtml,
+    reason: "Prepared documents Google Doc created",
+  },
+  invoice: {
+    fileName: "Invoice (Google Doc)",
+    title: (id) => `Invoice INV-A${id}`,
+    html: buildInvoiceHtml,
+    reason: "Invoice Google Doc created",
+  },
+};
+
+const PREPARED_FILE_NAMES = Object.values(PREPARED_DOCS).map((d) => d.fileName);
+
+// No download link is ever returned: view/edit happens in Google Docs only.
+const shapeDoc = (row) => ({
+  attachmentId: row.attachment_id,
+  name: row.file_name,
+  url: row.url_path,
+  createdAt: row.creation_timestamp,
+  canDownload: false,
+});
+
+const shapePrepared = (rows) => {
+  const byName = Object.fromEntries(rows.map((r) => [r.file_name, r]));
+  const pick = (kind) => {
+    const row = byName[PREPARED_DOCS[kind].fileName];
+    return row ? shapeDoc(row) : null;
+  };
+  return { preparedDocument: pick("preparedDocument"), invoice: pick("invoice") };
+};
+
+const PREPARED_ROWS_SQL = `
+  SELECT attachment_id, file_name, url_path, creation_timestamp
+    FROM attachment
+   WHERE application_id = $1
+     AND document_type_id IS NULL
+     AND file_name = ANY($2)
+     AND discontinued_at IS NULL
+   ORDER BY attachment_id`;
+
+// POST: create the application's Google Doc (and invoice) once; later calls return the same ones.
+const prepareApplicationService = async (csrUserId, applicationId, ip) => {
+  const who = String(csrUserId);
+  const client = await getPool().connect();
+  const createdFileIds = []; // Google files made in this call (removed again if we fail)
+
+  try {
+    await client.query("BEGIN");
+
+    // The row lock makes two quick clicks wait for each other: the second one
+    // then finds the first one's doc instead of creating another.
+    const appRes = await client.query(
+      `SELECT a.application_id, a.case_id, a.applicant_id, a.status_id,
+              a.appointment_date, a.appointment_location,
+              c.lead_contact_id, c.assigned_team_lead_user_id,
+              c.initial_deposit_received, c.balance_received, c.balance_amount_due, c.discount_amount,
+              cur.iso_code AS currency
+         FROM b_applications a
+         JOIN b_case c ON c.case_id = a.case_id
+    LEFT JOIN currency cur ON cur.currency_id = c.currency_id
+        WHERE a.application_id = $1
+          AND a.discontinued_at IS NULL
+          AND c.assigned_csr_user_id = $2
+        FOR UPDATE OF a`,
+      [applicationId, csrUserId],
+    );
+    const app = appRes.rows[0];
+    if (!app) {
+      // Same answer whether it doesn't exist or belongs to another CSR.
+      throw new HttpError(404, "APPLICATION_NOT_FOUND", "Application not found");
+    }
+
+    const existing = await client.query(PREPARED_ROWS_SQL, [applicationId, PREPARED_FILE_NAMES]);
+    const have = new Set(existing.rows.map((r) => r.file_name));
+    const missing = Object.values(PREPARED_DOCS).filter((d) => !have.has(d.fileName));
+
+    if (missing.length === 0) {
+      await client.query("ROLLBACK");
+      return { created: false, ...shapePrepared(existing.rows) };
+    }
+
+    if (app.status_id !== AS.APPOINTMENT_BOOKED) {
+      throw new HttpError(
+        409,
+        "INVALID_STATE",
+        `Documents can only be prepared when the application is at Appointment Booked (status ${AS.APPOINTMENT_BOOKED}); it is in ${app.status_id}`,
+      );
+    }
+
+    // Who may open/edit the docs: this CSR, the case's Team Lead, and the Lead Consultant(s).
+    const usersRes = await client.query(
+      `SELECT DISTINCT lower(trim(email)) AS email
+         FROM s_user
+        WHERE (user_id = $1 OR user_id = $2 OR user_role_type_id = $3)
+          AND is_active = 1
+          AND discontinued_at IS NULL
+          AND email IS NOT NULL AND trim(email) <> ''`,
+      [csrUserId, app.assigned_team_lead_user_id, ROLE_LEAD_CONSULTANT],
+    );
+    const editorEmails = usersRes.rows.map((r) => r.email);
+
+    const namesRes = await client.query(
+      `SELECT contact_id, first_name, surname FROM b_contact WHERE contact_id = ANY($1::bigint[])`,
+      [[app.applicant_id, app.lead_contact_id]],
+    );
+    const checklistRes = await client.query(
+      `SELECT dt.name, l.is_required, l.is_received
+         FROM app_doc_checklist l
+         JOIN document_type dt ON dt.document_type_id = l.document_type_id
+        WHERE l.application_id = $1 AND l.discontinued_at IS NULL
+        ORDER BY l.checklist_id`,
+      [applicationId],
+    );
+    const nameOf = (id) => {
+      const c = namesRes.rows.find((r) => String(r.contact_id) === String(id));
+      return c ? fullName(c.first_name, c.surname) : null;
+    };
+
+    const data = {
+      applicationId: app.application_id,
+      caseId: app.case_id,
+      applicantName: nameOf(app.applicant_id),
+      leadName: nameOf(app.lead_contact_id),
+      appointmentDate: app.appointment_date,
+      appointmentLocation: app.appointment_location,
+      checklist: checklistRes.rows,
+      currency: app.currency,
+      initialDepositReceived: app.initial_deposit_received,
+      balanceReceived: app.balance_received,
+      balanceAmountDue: app.balance_amount_due,
+      discountAmount: app.discount_amount,
+      issuedAt: new Date(),
+    };
+
+    for (const def of missing) {
+      const doc = await createDocument({ title: def.title(app.application_id), html: def.html(data), editorEmails });
+      createdFileIds.push(doc.fileId);
+
+      const ins = await client.query(
+        `INSERT INTO attachment
+           (case_id, application_id, document_type_id, file_name, file_path, url_path,
+            uploaded_by_customer, uploaded_by_user_id, created_by)
+         VALUES ($1,$2,NULL,$3,$4,$4,0,$5,$6)
+         RETURNING attachment_id`,
+        [app.case_id, app.application_id, def.fileName, doc.url, csrUserId, who],
+      );
+
+      await client.query(
+        `INSERT INTO system_log
+           (performed_by, table_name, record_id, action_type, field_changed, new_value,
+            reason, case_id, application_id, ip_address)
+         VALUES ($1,'attachment',$2,'PREPARED_DOC_CREATED','url_path',$3,$4,$5,$6,$7)`,
+        [who, ins.rows[0].attachment_id, doc.url, def.reason, app.case_id, app.application_id, ip || null],
+      );
+    }
+
+    const finalRows = await client.query(PREPARED_ROWS_SQL, [applicationId, PREPARED_FILE_NAMES]);
+    await client.query("COMMIT");
+
+    return { created: true, ...shapePrepared(finalRows.rows) };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    // Nothing was saved, so remove any Google file made in this call: a retry starts clean.
+    await Promise.all(createdFileIds.map((id) => deleteDocument(id)));
+
+    if (error instanceof GoogleDocsError) {
+      if (error.code === "GOOGLE_NOT_CONFIGURED") {
+        throw new HttpError(503, error.code, "Google Docs is not configured on the server");
+      }
+      throw new HttpError(502, error.code, "Could not reach Google Docs. Nothing was created; please try again.");
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+// GET: read the saved links. CSR (own case), Team Lead (own case), Lead Consultant (any case).
+const getPreparedDocumentsService = async (user, applicationId) => {
+  const roleId = Number(user.user_role_type_id);
+  const params = [applicationId];
+  let scope = "";
+
+  if (roleId === ROLE_CSR) {
+    params.push(user.user_id);
+    scope = `AND c.assigned_csr_user_id = $${params.length}`;
+  } else if (roleId === ROLE_TEAM_LEAD) {
+    params.push(user.user_id);
+    scope = `AND c.assigned_team_lead_user_id = $${params.length}`;
+  } else if (roleId !== ROLE_LEAD_CONSULTANT) {
+    throw new HttpError(403, "FORBIDDEN", "You do not have permission to access this resource");
+  }
+
+  const appRes = await getPool().query(
+    `SELECT a.application_id
+       FROM b_applications a
+       JOIN b_case c ON c.case_id = a.case_id
+      WHERE a.application_id = $1 AND a.discontinued_at IS NULL ${scope}`,
+    params,
+  );
+  if (!appRes.rows[0]) {
+    throw new HttpError(404, "APPLICATION_NOT_FOUND", "Application not found");
+  }
+
+  const rows = await getPool().query(PREPARED_ROWS_SQL, [applicationId, PREPARED_FILE_NAMES]);
+  const prepared = shapePrepared(rows.rows);
+  return { applicationId, prepared: Boolean(prepared.preparedDocument), ...prepared };
+};
+
+module.exports = {
+  HttpError,
+  listMyTasksService,
+  getMyTaskService,
+  completeTaskService,
+  prepareApplicationService,
+  getPreparedDocumentsService,
+};

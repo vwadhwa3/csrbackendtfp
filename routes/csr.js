@@ -2,7 +2,12 @@ const express = require("express");
 
 const { authenticate } = require("../middleware/auth.middleware");
 const { ROLES, requireRole } = require("../middleware/role.middleware");
-const { listMyTasks, getTask, completeTask } = require("../controllers/csr.controller");
+const {
+  listMyTasks,
+  getTask,
+  completeTask,
+  prepareApplication,
+} = require("../controllers/csr.controller");
 
 const router = express.Router();
 
@@ -12,5 +17,8 @@ router.use(authenticate, requireRole(ROLES.CSR));
 router.get("/tasks", listMyTasks);
 router.get("/tasks/:taskId", getTask);
 router.post("/tasks/:taskId/complete", completeTask);
+
+// "Prepare" button: create the application's Google Doc once, then just open it.
+router.post("/applications/:applicationId/prepare", prepareApplication);
 
 module.exports = router;

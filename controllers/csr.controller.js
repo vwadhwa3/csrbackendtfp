@@ -3,7 +3,9 @@ const {
   listMyTasksService,
   getMyTaskService,
   completeTaskService,
-} = require("../services/csr.service");
+  prepareApplicationService,
+  getPreparedDocumentsService,
+} =require("../services/csr.service");
 
 const parseId = (value, name) => {
   const id = Number(value);
@@ -70,4 +72,28 @@ const completeTask = async (req, res) => {
   }
 };
 
-module.exports = { listMyTasks, getTask, completeTask };
+// POST /api/csr/applications/:applicationId/prepare
+// First call creates the Google Doc (+ invoice); later calls return the same ones.
+const prepareApplication = async (req, res) => {
+  try {
+    const applicationId = parseId(req.params.applicationId, "applicationId");
+    const result = await prepareApplicationService(req.user.user_id, applicationId, req.ip);
+
+    return res.status(result.created ? 201 : 200).json({ success: true, ...result });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
+// GET /api/applications/:applicationId/prepared-documents  (CSR, Team Lead, Lead Consultant)
+const getPreparedDocuments = async (req, res) => {
+  try {
+    const applicationId = parseId(req.params.applicationId, "applicationId");
+    const result = await getPreparedDocumentsService(req.user, applicationId);
+    return res.status(200).json({ success: true, ...result });
+  } catch (error) {
+    return handleError(res, error);
+  }
+};
+
+module.exports = { listMyTasks, getTask, completeTask, prepareApplication, getPreparedDocuments };
